@@ -1,2 +1,2 @@
 # LambScan
-AWS Lambda-based port scanner
+Lambda port scanner
