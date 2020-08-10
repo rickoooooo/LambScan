@@ -2,6 +2,7 @@ import boto3
 import argparse
 import json
 import threading
+import ipaddress
 
 # Constants
 FUNCTION_NAME = "lambscan" # Prefix for lambda function names
@@ -11,7 +12,7 @@ FUNCTION_NAME = "lambscan" # Prefix for lambda function names
 ##########################################
 def parse_args():
     parser = argparse.ArgumentParser(description='LambScan by Rick Osgood')
-    parser.add_argument('target', nargs='?', help='Target to scan. Example: 8.8.8.8')
+    parser.add_argument('target', nargs='?', help='Target to scan or file containing line-separated list of targets.')
     parser.add_argument('ports', nargs='?', help='Ports to scan. Example:80,81,1000-2000')
     parser.add_argument('role', nargs='?', help='AWS IAM role ARN for lambda functions to use')
     parser.add_argument('--workers', dest='worker_num', help='Number of Lambda workers to create')
@@ -44,6 +45,7 @@ def parse_args():
     # Defaults
     scan_params['worker_num']= 1
     scan_params['max_threads'] = 1
+
     if args.worker_num:
         scan_params['worker_num'] = int(args.worker_num)
     if args.max_threads:
@@ -82,6 +84,28 @@ def lambda_clean():
         exit(2)
 
 #####################################
+# Build list of targets
+#####################################
+def build_target_list_from_file(target_file):
+    target_list = []
+
+    try:
+        f = open(target_file, 'r')
+        for line in f:
+            line = line.strip()
+            # Is it a CIDR range?
+            if "/" in line:
+                for host in ipaddress.ip_network(line, strict=False).hosts():
+                    target_list.append(str(host))
+            else:
+                target_list.append(str(ipaddress.ip_address(line)))
+    except Exception as e:
+        print("ERROR: Unable to parse input target list. " + e)
+
+    return target_list
+
+
+#####################################
 # Create lambda workers
 #####################################
 def lambda_create_workers(lambda_client, worker_num, fn_name):
@@ -94,6 +118,7 @@ def lambda_create_workers(lambda_client, worker_num, fn_name):
             Role=fn_role,
             Handler=f"{fn_name}.lambda_handler",
             Code={'ZipFile': open(f"{fn_name}.zip", 'rb').read(), },
+            Timeout=3
         )
 
 #####################################
@@ -109,8 +134,11 @@ def scan_port(lambda_client, event, worker_counter):
 
     result = json.loads(response['Payload'].read().decode('utf-8'))
 
+    if 'errorMessage' in result:
+        print(f"{event['host']}, {event['port']}/closed")
+        #print(f"Error scanning {event['host']} port {event['port']}: " + result['errorMessage'])
     # True or False
-    if result['body'] == True:
+    elif result['body'] == True:
         print(f"{event['host']}, {event['port']}/open")
     else:
         print(f"{event['host']}, {event['port']}/closed")
@@ -126,7 +154,6 @@ def scan_ports(lambda_client, scan_params):
     worker_num = scan_params['worker_num']
     ports = []
 
-    print("[*] Scanning ports...")
     for entry in port_list:
         e = str(entry)
         # Break up port range into individual ports
@@ -159,7 +186,7 @@ def scan_ports(lambda_client, scan_params):
             if worker_counter == worker_num:
                 worker_counter = 0
 
-            # Launch daemon thread to scan a single port?
+            # Launch daemon thread to scan a single port
             t = threading.Thread(target=scan_port, args=(lambda_client, event, worker_counter), daemon=True)
             t.start()
 
@@ -200,6 +227,7 @@ def lambda_function_count(lambda_client, fn_name):
 if __name__ == "__main__":
     # Defaults
     fn_name = FUNCTION_NAME
+    target_list = []
 
     # Setup lambda client
     lambda_client = boto3.client('lambda')
@@ -209,6 +237,18 @@ if __name__ == "__main__":
 
     # set execution role
     fn_role = scan_params['role']
+
+    if scan_params['target'].count('.') == 3:   # IP address
+        if "/" in scan_params['target']:         # CIDR range
+            for host in ipaddress.ip_network(scan_params['target'], strict=False).hosts():
+                target_list.append(str(host))
+        else:
+            target_list = [scan_params['target']]
+    elif scan_params['target'].count('.') == 1: # File name
+        target_list = build_target_list_from_file(scan_params['target'])
+    else:
+        print("ERROR: Could not parse target parameter.")
+        exit(1)
 
     # Create Lambda worker functions
     try:
@@ -222,9 +262,12 @@ if __name__ == "__main__":
     function_count = str(lambda_function_count(lambda_client, fn_name))
     print(f"[*] Created {function_count} LambScan functions")
 
+    print("[*] Scanning ports...")
     # Initiate port scan
     try:
-        scan_ports(lambda_client, scan_params)
+        for host in target_list:
+            scan_params['target'] = host
+            scan_ports(lambda_client, scan_params)
     except Exception as e:
         print("ERROR: Something went wrong during port scanning!\nException: " + str(e))
         lambda_clean()
